@@ -9,8 +9,11 @@
 - **全方法支持** — 接收 GET、POST、PUT、DELETE 等任意 HTTP 方法
 - **详细日志记录** — 记录客户端 IP、端口、请求行、Headers、Query 参数、Body 等信息
 - **JSONL 日志格式** — 每行一条 JSON 记录，便于 grep、jq 等工具处理
+- **按日分文件** — 自动按天生成日志文件，支持 strftime 路径模板
 - **内置 /echo 接口** — 返回完整的请求信息，方便调试
 - **插件机制** — 通过 @plugin 装饰器自定义路由和响应逻辑
+- **守护进程模式** — 支持 --daemon 后台运行，无需手动 nohup
+- **在线日志浏览** — 内置 Web 日志查看器，支持文件列表、在线浏览、分页、下载
 - **CORS 支持** — 默认开启跨域，适合前端联调
 - **多线程处理** — 基于 ThreadingHTTPServer，支持并发请求
 - **TLS/HTTPS** — 自动生成自签名证书，支持 HTTPS 服务
@@ -31,6 +34,17 @@ python httplog.py --verbose
 
 # 启用 HTTPS（自动生成自签名证书）
 python httplog.py --https
+
+# 后台守护进程模式
+python httplog.py --daemon
+python httplog.py --daemon --port 9000 --log mylog.jsonl
+python httplog.py --daemon --pid /var/run/httplog.pid
+
+# 停止守护进程
+python httplog.py --stop --pid httplog.pid
+
+# 启动日志浏览器（访问 /logs）
+python httplog.py --log-viewer /logs
 `
 
 ### 命令行参数
@@ -41,7 +55,10 @@ python httplog.py --https
 | --port | 8080 | 监听端口 |
 | --log | httplog.jsonl | 日志文件路径 |
 | --verbose | 关闭 | 将访问日志输出到 stderr |
-| --https | 关闭 | 启用 HTTPS（自签名证书） |
+| --daemon | 关闭 | 后台守护进程模式运行 |
+| --pid | httplog.pid | PID 文件路径（配合 --daemon/--stop 使用） |
+| --stop | - | 停止指定的守护进程（需配合 --pid 使用） |
+| --log-viewer | 关闭 | 启用内置 Web 日志浏览器，指定访问路径，如 /logs |
 
 ### 测试请求
 
@@ -63,7 +80,59 @@ curl -X POST http://127.0.0.1:8080/test \
   -d 'ping me'
 `
 
+
+## 后台运行（守护进程）
+
+使用 --daemon 参数可将服务转为后台守护进程，无需手动 nohup：
+ohup：
+
+```bash
+# 启动守护进程
+python httplog.py --daemon
+
+# 自定义配置 + 守护进程
+python httplog.py --daemon --host 0.0.0.0 --port 9000 --log /var/log/httplog.jsonl
+
+# 指定 PID 文件路径
+python httplog.py --daemon --pid /var/run/httplog.pid
+
+# 查看守护进程状态
+cat httplog.pid
+
+# 停止守护进程
+python httplog.py --stop --pid httplog.pid
+
+# 启动日志浏览器（访问 /logs）
+python httplog.py --log-viewer /logs
+```
+
+守护进程的 stdout/stderr 输出会保存到 {pid文件路径}.stdout，例如 httplog.pid.stdout。
+
+### 工作原理
+
+- **Linux/macOS**: 采用经典 double-fork 方式脱离终端，重定向标准输入输出到文件
+- **Windows**: 通过 CREATE_NO_WINDOW 标志启动无窗口后台子进程，父进程退出
+
 ## 日志格式
+
+日志自动按天分文件，每个文件名包含日期：
+
+`
+httplog-2026-06-05.jsonl
+httplog-2026-06-06.jsonl
+httplog-2026-06-07.jsonl
+`
+
+支持 strftime 路径模板：
+
+| --log 参数 | 实际文件 |
+|------|------|
+| httplog.jsonl | httplog-2026-06-05.jsonl |
+| logs/httplog.jsonl | logs/httplog-2026-06-05.jsonl |
+| httplog-%Y%m.jsonl | httplog-202606.jsonl |
+| /var/log/%Y/%m/httplog.jsonl | /var/log/2026/06/httplog.jsonl |
+
+目录不存在时会自动创建。
 
 每条日志为一行 JSON，记录完整请求信息：
 
@@ -189,6 +258,35 @@ httplog/
 - **前端开发** — 作为 mock 服务器，支持 CORS 跨域
 - **请求回放** — 从 JSONL 日志中提取请求数据进行分析
 - **安全测试** — 通过插件实现简单的访问控制
+
+
+## 在线日志浏览器
+
+启动时添加 --log-viewer 参数，即可通过浏览器查看日志：
+
+`ash
+python httplog.py --log-viewer /logs
+`
+
+访问 http://127.0.0.1:8080/logs，即可看到日志文件列表。
+
+### 功能
+
+- **文件列表** — 自动扫描日志目录，显示文件名、修改时间、文件大小
+- **在线浏览** — 点击文件名查看日志内容，JSON 语法高亮
+- **分页导航** — 支持 First/Prev/Next/Last 分页，每页默认 200 行，最大 2000 行
+- **下载文件** — 支持将日志文件下载到本地
+- **安全校验** — 防止路径穿越攻击，仅访问日志目录内的文件
+
+### 访问地址
+
+| 地址 | 说明 |
+|------|------|
+| /logs | 日志文件列表 |
+| /logs?file=httplog-2026-06-05.jsonl | 在线浏览指定日志 |
+| /logs?file=httplog-2026-06-05.jsonl&offset=0&limit=100 | 分页查看 |
+| /logs?file=httplog-2026-06-05.jsonl&download=1 | 下载日志文件 |
+
 
 ## License
 
