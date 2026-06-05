@@ -4,6 +4,7 @@ viewer.py
 Built-in web log viewer: file list, online browsing, download.
 """
 
+import base64
 import html
 import os
 import re
@@ -15,6 +16,66 @@ class LogViewerHandler:
     """
     built-in log viewer: file list, online browsing, download.
     """
+
+    def handle_request(self, handler, log_pattern, base_path):
+        """Route incoming request to the appropriate viewer handler."""
+        from urllib.parse import urlparse, parse_qs
+        import sys
+
+        parsed = urlparse(handler.path)
+        query = parse_qs(parsed.query)
+        sub_path = parsed.path[len(base_path):]
+
+        try:
+            if sub_path in ("", "/"):
+                if "file" in query:
+                    filename = query['file'][0]
+                    if query.get('download'):
+                        resp = self.handle_download(handler, log_pattern, filename)
+                    else:
+                        resp = self.handle_view(handler, log_pattern, filename, query)
+                else:
+                    resp = self.handle_list(handler, log_pattern)
+            elif sub_path.startswith("/stats"):
+                resp = self.handle_stats(handler)
+            elif sub_path.startswith("/download/"):
+                filename = sub_path[len("/download/"):]
+                resp = self.handle_download(handler, log_pattern, filename)
+            else:
+                resp = make_response(404, {'Content-Type': 'text/html; charset=utf-8'},
+                                    self._err(base_path, 'Page not found'))
+        except Exception as e:
+            sys.stderr.write("[!] Viewer error: {}\\n".format(e))
+            import traceback
+            traceback.print_exc()
+            resp = make_response(500, {'Content-Type': 'text/html; charset=utf-8'},
+                                 self._err(base_path, "Internal error: " + str(e)))
+
+        # Send response via the HTTP handler
+        self._send(handler, resp)
+
+    def _send(self, handler, resp):
+        """Send a make_response dict via the HTTP handler."""
+        status = resp["status"]
+        headers = resp["headers"]
+        body = resp.get("body")
+
+        handler.send_response(status)
+        for k, v in headers.items():
+            handler.send_header(k, v)
+
+        if isinstance(body, bytes):
+            body_bytes = body
+        elif isinstance(body, str):
+            body_bytes = body.encode("utf-8")
+        else:
+            body_bytes = b""
+
+        handler.send_header("Content-Length", str(len(body_bytes)))
+        handler.end_headers()
+        if body_bytes:
+            handler.wfile.write(body_bytes)
+
 
     CSS = """
     <style>
@@ -60,6 +121,22 @@ class LogViewerHandler:
       .empty { text-align:center; padding:60px 20px; color:#999; }
       .badge { display:inline-block; background:#e8f4f8; color:#0077b6; padding:2px 8px;
                border-radius:4px; font-size:12px; margin-left:8px; }
+      .json-btn { display:inline-block; margin-left:8px; padding:1px 5px;
+                  font-size:11px; color:#8ecae6; cursor:pointer; border:1px solid #333;
+                  border-radius:3px; background:transparent; font-family:inherit; }
+      .json-btn:hover { background:#2a2a3e; }
+      .json-modal { display:none; position:fixed; top:0; left:0; width:100vw; height:100vh;
+                    background:rgba(0,0,0,.6); z-index:1000; justify-content:center;
+                    align-items:center; }
+      .json-modal.show { display:flex; }
+      .json-modal-box { background:#1a1a2e; color:#e0e0e0; border-radius:8px;
+                         max-width:900px; width:90vw; max-height:85vh; overflow:auto;
+                         padding:20px; font-family:"Cascadia Code","Fira Code",Consolas,monospace;
+                         font-size:13px; line-height:1.6; white-space:pre-wrap; word-break:break-all;
+                         box-shadow:0 8px 32px rgba(0,0,0,.4); position:relative; }
+      .json-modal-close { position:sticky; top:0; float:right; background:none; border:none;
+                           color:#8ecae6; font-size:18px; cursor:pointer; padding:4px 8px; }
+      .json-modal-close:hover { color:#fff; }
     </style>
     """
 
@@ -146,7 +223,9 @@ class LogViewerHandler:
         for i, line in enumerate(lines):
             ln = offset + i + 1
             hl = self._hl(line.rstrip())
-            rendered += '<span class="ln">' + str(ln).rjust(6) + '</span>' + hl + "\n"
+            raw = line.rstrip()
+            encoded = base64.b64encode(raw.encode('utf-8')).decode('ascii')
+            rendered += '<span class="ln">' + str(ln).rjust(6) + '</span>' + hl + '<button class="json-btn" data-b64="' + encoded + '" onclick="showJSON(this)">{}</button>' + "\n"
 
         has_prev = offset > 0
         has_next = offset + limit < total
@@ -178,6 +257,28 @@ class LogViewerHandler:
             '<div class="header"><h1>' + html.escape(filename) + '</h1>'
             '<a href="' + html.escape(bp, quote=True) + '">Back to list</a> <a href="/echo">Echo</a></div>'
             '<div class="container"><div class="card">' + nav + '<div class="log-box">' + rendered + '</div></div></div>'
+            '<div id="jsonModal" class="json-modal" onclick="if(event.target===this)this.classList.remove(\'show\')">'
+            '<div class="json-modal-box">'
+            '<button class="json-modal-close" onclick="this.parentElement.parentElement.classList.remove(\'show\')">X</button>'
+            '<div id="jsonModalContent"></div></div></div>'
+            '<script>'
+            'function showJSON(el){'
+            '  var b64=el.getAttribute("data-b64");'
+            '  if(!b64) return;'
+            '  try{'
+            '    var decoded=atob(b64);var raw=new TextDecoder().decode(Uint8Array.from(decoded,c=>c.charCodeAt(0)));'
+            '    try{'
+            '      var obj=JSON.parse(raw);'
+            '      document.getElementById("jsonModalContent").textContent=JSON.stringify(obj,null,2);'
+            '    }catch(e){'
+            '      document.getElementById("jsonModalContent").textContent="JSON parse error: "+e.message+"\\n\\nRaw:\\n"+raw;'
+            '    }'
+            '  }catch(e2){'
+            '    document.getElementById("jsonModalContent").textContent="Decode error: "+e2.message;'
+            '  }'
+            '  document.getElementById("jsonModal").classList.add("show");'
+            '}'
+            '</script>'
             "</body></html>"
         )
         return make_response(200, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}, page)
@@ -314,3 +415,5 @@ class LogViewerHandler:
             '<div class="container"><div class="card"><div class="empty">' + html.escape(msg) + '</div></div></div>'
             + '</body></html>'
         )
+
+

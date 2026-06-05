@@ -28,6 +28,7 @@ import argparse
 import base64
 import collections
 import os
+import socket
 import threading
 import sys
 import time
@@ -35,7 +36,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from daemon import daemonize, stop_daemon
+from daemon import daemonize, stop_daemon, write_pid_file, remove_pid_file, check_existing_instance
 from plugins import run_plugins
 from utils import (
     DEFAULT_HOST, DEFAULT_PORT, DEFAULT_LOG_FILE, DEFAULT_PID_FILE,
@@ -157,6 +158,7 @@ class HttpLogHandler(BaseHTTPRequestHandler):
         }
 
         return request_info
+
     def write_log(self, request_info):
         """
         将请求信息追加写入当日 JSONL 日志文件。
@@ -172,153 +174,106 @@ class HttpLogHandler(BaseHTTPRequestHandler):
             sys.stderr.write(f"[!] Failed to write log: {e}\n")
 
     def run_plugins(self, request_info):
-        """Delegate to plugins module."""
-        return run_plugins(request_info)
-    def handle_echo(self, request_info):
         """
-        /echo 接口：返回完整请求信息。
+        Run registered plugins.
         """
-        return make_response(
-            status=200,
-            headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "Cache-Control": "no-store",
-            },
-            body={
-                "ok": True,
-                "echo": request_info,
-            }
-        )
-    def handle_default(self, request_info):
-        """
-        默认返回。
-        """
-        return make_response(
-            status=200,
-            headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "Cache-Control": "no-store",
-            },
-            body={
-                "ok": True,
-                "message": "request logged",
-                "method": request_info["request"]["method"],
-                "path": request_info["url"]["path"],
-                "client": request_info["client"],
-            }
-        )
-    def send_custom_response(self, response):
-        """
-        发送响应。
-        """
-        status = int(response.get("status", 200))
-        headers = response.get("headers") or {}
-        body = response.get("body", "")
+        try:
+            run_plugins(request_info)
+        except Exception as e:
+            sys.stderr.write(f"[!] Plugin error: {e}\n")
 
-        if isinstance(body, (dict, list)):
+    def send_json_response(self, response_data):
+        """
+        Send a JSON response.
+        """
+        status = response_data.get("status", 200)
+        headers = response_data.get("headers", {})
+        body = response_data.get("body")
+
+        status_messages = {
+            200: "OK",
+            201: "Created",
+            204: "No Content",
+            301: "Moved Permanently",
+            302: "Found",
+            304: "Not Modified",
+            400: "Bad Request",
+            401: "Unauthorized",
+            403: "Forbidden",
+            404: "Not Found",
+            405: "Method Not Allowed",
+            500: "Internal Server Error",
+        }
+
+        reason = status_messages.get(status, "Unknown")
+        self.send_response(status, reason)
+
+        for key, value in headers.items():
+            self.send_header(key, value)
+
+        if body is not None:
             body_bytes = json_dumps(body).encode("utf-8")
-            headers.setdefault("Content-Type", "application/json; charset=utf-8")
-        elif isinstance(body, bytes):
-            body_bytes = body
-        else:
-            body_bytes = str(body).encode("utf-8")
-            headers.setdefault("Content-Type", "text/plain; charset=utf-8")
-
-        headers.setdefault("Content-Length", str(len(body_bytes)))
-        headers.setdefault("Access-Control-Allow-Origin", "*")
-        headers.setdefault("Access-Control-Allow-Methods", "*")
-        headers.setdefault("Access-Control-Allow-Headers", "*")
-
-        self.send_response(status)
-
-        for k, v in headers.items():
-            self.send_header(k, v)
-
-        self.end_headers()
-
-        if self.command != "HEAD":
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.end_headers()
             self.wfile.write(body_bytes)
+        else:
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     def handle_any_request(self):
         """
-        处理任意请求。
+        Main handler for all HTTP requests.
         """
-        try:
-            request_info = self.build_request_info()
+        request_info = self.build_request_info()
+        parsed = urlparse(self.path)
 
-            # 先写日志
+        # Skip logging for internal endpoints (healthz, log viewer)
+        is_internal = parsed.path in ("/healthz", "/favicon.ico")
+        if not is_internal and self.server.log_viewer and parsed.path.startswith(self.server.log_viewer_path):
+            is_internal = True
+
+        if not is_internal:
             self.write_log(request_info)
+        self.run_plugins(request_info)
 
-            # record stats
-            self.server.stats.record(request_info)
+        # Health check endpoint
+        if parsed.path == "/healthz":
+            response = self.handle_healthz(request_info)
+            self.send_json_response(response)
+            return
 
-            path = request_info["url"]["path"]
+        # Log viewer
+        if self.server.log_viewer and parsed.path.startswith(self.server.log_viewer_path):
+            viewer = self.server.log_viewer
+            viewer.handle_request(self, self.server.log_file, self.server.log_viewer_path)
+            return
 
-            # 内置 /healthz
-            if path == "/healthz":
-                response = self.handle_healthz(request_info)
-                self.send_custom_response(response)
-                return
-
-            # 内置 /stats
-            if self.server.log_viewer and path == "/stats":
-                response = self.server.log_viewer.handle_stats(self)
-                self.send_custom_response(response)
-                return
-
-            # 内置 /echo
-            if path == "/echo":
-                response = self.handle_echo(request_info)
-                self.send_custom_response(response)
-                return
-
-            # 内置 log viewer
-            if self.server.log_viewer and self.command == "GET" and path == self.server.log_viewer_path:
-                viewer = self.server.log_viewer
-                q = request_info["url"]["query"]
-                filename = q.get("file", [None])[0]
-                if filename and q.get("download"):
-                    response = viewer.handle_download(self, self.server.log_file, filename)
-                elif filename:
-                    response = viewer.handle_view(self, self.server.log_file, filename, q)
-                else:
-                    response = viewer.handle_list(self, self.server.log_file)
-                self.send_custom_response(response)
-                return
-
-            # 插件处理
-            plugin_response = self.run_plugins(request_info)
-            if plugin_response is not None:
-                self.send_custom_response(plugin_response)
-                return
-
-            # 默认处理
-            response = self.handle_default(request_info)
-            self.send_custom_response(response)
-
-        except Exception as e:
-            traceback.print_exc()
+        # Echo endpoint
+        if parsed.path == "/echo":
             response = make_response(
-                status=500,
-                headers={
-                    "Content-Type": "application/json; charset=utf-8"
-                },
-                body={
-                    "ok": False,
-                    "message": "internal server error",
-                    "error": str(e),
-                }
+                status=200,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                body=request_info
             )
-            self.send_custom_response(response)
+            self.send_json_response(response)
+            return
+
+        # Default: echo request info
+        response = make_response(
+            status=200,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            body=request_info
+        )
+        self.send_json_response(response)
 
 
 # =========================
-# Server
+# Request Statistics
 # =========================
-
-
 class RequestStats:
-    """Thread-safe request statistics tracker."""
+    """
+    Thread-safe request statistics tracker.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -361,6 +316,7 @@ class HttpLogServer(ThreadingHTTPServer):
         self.log_viewer_path = log_viewer_path
         self.log_viewer = LogViewerHandler() if log_viewer_path else None
         self.stats = RequestStats()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -412,12 +368,22 @@ def main():
     )
 
     parser.add_argument(
+        "--_daemon-child",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
+
+    parser.add_argument(
         "--stop",
         action="store_true",
         help="stop the running daemon process (requires --pid)"
     )
 
     args = parser.parse_args()
+
+    # auto-prepend / to --log-viewer path
+    if args.log_viewer and not args.log_viewer.startswith("/"):
+        args.log_viewer = "/" + args.log_viewer
 
     # --stop: 停止守护进程
     if args.stop:
@@ -426,15 +392,38 @@ def main():
 
     # --daemon: 后台运行
     if args.daemon:
+        # Check for existing instance
+        if not check_existing_instance(args.pid):
+            sys.exit(1)
+
+        # Pre-check: verify port is available before forking
+        try:
+            _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            _sock.bind((args.host, args.port))
+            _sock.close()
+        except OSError as e:
+            print("[!] Port {} is not available: {}".format(args.port, e))
+            print("[!] Is another instance already running?")
+            sys.exit(1)
+
         daemonize(args.pid)
 
-    server = HttpLogServer(
-        server_address=(args.host, args.port),
-        RequestHandlerClass=HttpLogHandler,
-        log_file=args.log,
-        verbose=args.verbose,
-        log_viewer_path=args.log_viewer,
-    )
+    try:
+        server = HttpLogServer(
+            server_address=(args.host, args.port),
+            RequestHandlerClass=HttpLogHandler,
+            log_file=args.log,
+            verbose=args.verbose,
+            log_viewer_path=args.log_viewer,
+        )
+    except OSError as e:
+        print("[!] Failed to start server: {}".format(e))
+        sys.exit(1)
+
+    # Write PID file only after server successfully binds the port
+    if args.daemon or args._daemon_child:
+        write_pid_file(args.pid)
 
     print(f"[+] HttpLog server listening on http://{args.host}:{args.port}")
     print(f"[+] Log file: {args.log}")
@@ -449,7 +438,11 @@ def main():
         print("\n[+] Stopping server...")
     finally:
         server.server_close()
+        # Clean up PID file if running as daemon
+        if args.daemon or args._daemon_child:
+            remove_pid_file(args.pid)
 
 
 if __name__ == "__main__":
     main()
+
