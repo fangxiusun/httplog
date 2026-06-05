@@ -13,7 +13,9 @@
 - **内置 /echo 接口** — 返回完整的请求信息，方便调试
 - **插件机制** — 通过 @plugin 装饰器自定义路由和响应逻辑
 - **守护进程模式** — 支持 --daemon 后台运行，无需手动 nohup
-- **在线日志浏览** — 内置 Web 日志查看器，支持文件列表、在线浏览、分页、下载
+- **健康检查** — /healthz 端点，返回服务状态、运行时间、请求计数
+- **请求统计** — /stats 仪表盘，展示方法分布、状态码、热门路径、来源 IP Top N
+- - **在线日志浏览** — 内置 Web 日志查看器，支持文件列表、在线浏览、分页、下载
 - **CORS 支持** — 默认开启跨域，适合前端联调
 - **多线程处理** — 基于 ThreadingHTTPServer，支持并发请求
 - **TLS/HTTPS** — 自动生成自签名证书，支持 HTTPS 服务
@@ -42,6 +44,12 @@ python httplog.py --daemon --pid /var/run/httplog.pid
 
 # 停止守护进程
 python httplog.py --stop --pid httplog.pid
+
+# 健康检查
+curl http://127.0.0.1:8080/healthz
+
+# 请求统计仪表盘
+# browser: http://127.0.0.1:8080/stats
 
 # 启动日志浏览器（访问 /logs）
 python httplog.py --log-viewer /logs
@@ -101,6 +109,12 @@ cat httplog.pid
 
 # 停止守护进程
 python httplog.py --stop --pid httplog.pid
+
+# 健康检查
+curl http://127.0.0.1:8080/healthz
+
+# 请求统计仪表盘
+# browser: http://127.0.0.1:8080/stats
 
 # 启动日志浏览器（访问 /logs）
 python httplog.py --log-viewer /logs
@@ -235,19 +249,24 @@ equest.version | HTTP 版本 |
 
 `
 httplog/
-└── httplog.py      # 单文件实现，包含服务器、处理器、插件系统
+└── httplog.py      # 主入口：服务器、请求处理器、统计、main()
+    ├── daemon.py       # 守护进程：fork/CREATE_NO_WINDOW/PID管理
+    ├── viewer.py       # Web日志浏览器：文件列表、在线浏览、下载、统计仪表盘
+    ├── plugins.py      # 插件机制：@装饰器 + 示例插件
+    └── utils.py        # 工具函数：时间、日志路径、JSON、Body解析、全局配置
 `
 
 ## 依赖
 
 无外部依赖，仅使用 Python 标准库：
 
-- http.server — HTTP 服务器
+- http.server — HTTP 服务器（ThreadingHTTPServer）
 - json — JSON 处理
 - argparse — 命令行解析
-- datetime — 时间戳
-- ssl — HTTPS 支持
-- 	hreading — 多线程（通过 ThreadingHTTPServer）
+- threading — 线程安全锁
+- collections — 统计计数器
+- re / html — 正则表达式 / XSS 转义
+- os / signal / subprocess — 守护进程管理
 
 要求 Python 3.7+。
 
@@ -287,6 +306,27 @@ python httplog.py --log-viewer /logs
 | /logs?file=httplog-2026-06-05.jsonl&offset=0&limit=100 | 分页查看 |
 | /logs?file=httplog-2026-06-05.jsonl&download=1 | 下载日志文件 |
 
+
+## Built-in Endpoints
+
+| Endpoint | Description |
+|------|------|
+| /echo | Returns full request info as JSON |
+| /healthz | Health check: {"ok":true, "uptime":"5m 30s", "requests":1234, "errors":0} |
+| /stats | Stats dashboard (requires --log-viewer) |
+
+### /stats Dashboard
+
+Access /stats to view:
+
+- **Uptime** - server running time
+- **Total Requests** - total request count
+- **Errors (5xx)** - server error count
+- **Unique IPs** - unique client count
+- **Method Distribution** - GET/POST/PUT etc.
+- **Status Codes** - 200/404/500 etc.
+- **Top Paths** - top 10 most visited paths
+- **Top IPs** - top 10 most active clients
 
 ## License
 
