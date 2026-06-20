@@ -75,8 +75,19 @@ def _daemonize_windows(pid_file):
     daemon_log = pid_file + ".stdout"
     log_fd = open(daemon_log, "a", encoding="utf-8")
 
-    # Rebuild command line, remove --daemon and --stop
-    new_args = [a.replace("--daemon", "--_daemon-child") for a in sys.argv[1:] if a != "--stop"]
+    # Rebuild command line, replace --daemon with --_daemon-child, remove --stop
+    new_args = []
+    skip_next = False
+    for i, a in enumerate(sys.argv[1:]):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--stop":
+            continue
+        if a == "--daemon":
+            new_args.append("--_daemon-child")
+        else:
+            new_args.append(a)
     cmd = [sys.executable, os.path.abspath(sys.argv[0])] + new_args
 
     CREATE_NO_WINDOW = 0x08000000

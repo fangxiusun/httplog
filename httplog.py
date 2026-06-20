@@ -34,7 +34,11 @@ import sys
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http import HTTPStatus
 from urllib.parse import urlparse, parse_qs
+
+# Use HTTPStatus for reason phrases
+http_responses = {v.value: v.phrase for v in HTTPStatus}
 
 from daemon import daemonize, stop_daemon, write_pid_file, remove_pid_file, check_existing_instance
 from plugins import run_plugins
@@ -84,7 +88,7 @@ class HttpLogHandler(BaseHTTPRequestHandler):
         self.handle_any_request()
 
     def do_CONNECT(self):
-        self.handle_any_request()
+        self.send_error(405, "CONNECT method not supported")
 
     def handle_healthz(self, request_info):
         """Health check endpoint."""
@@ -178,7 +182,10 @@ class HttpLogHandler(BaseHTTPRequestHandler):
         Run registered plugins.
         """
         try:
-            run_plugins(request_info)
+            response_data = run_plugins(request_info)
+            if response_data:
+                self.send_json_response(response_data)
+                return response_data
         except Exception as e:
             sys.stderr.write(f"[!] Plugin error: {e}\n")
 
@@ -190,29 +197,24 @@ class HttpLogHandler(BaseHTTPRequestHandler):
         headers = response_data.get("headers", {})
         body = response_data.get("body")
 
-        status_messages = {
-            200: "OK",
-            201: "Created",
-            204: "No Content",
-            301: "Moved Permanently",
-            302: "Found",
-            304: "Not Modified",
-            400: "Bad Request",
-            401: "Unauthorized",
-            403: "Forbidden",
-            404: "Not Found",
-            405: "Method Not Allowed",
-            500: "Internal Server Error",
-        }
-
-        reason = status_messages.get(status, "Unknown")
+        reason = http_responses.get(status, "Unknown")
         self.send_response(status, reason)
+
+        # CORS headers
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
+        self.send_header("Access-Control-Allow-Headers", "*")
 
         for key, value in headers.items():
             self.send_header(key, value)
 
         if body is not None:
-            body_bytes = json_dumps(body).encode("utf-8")
+            try:
+                body_bytes = json_dumps(body).encode("utf-8")
+            except (TypeError, ValueError) as e:
+                body_bytes = json_dumps({"error": "Serialization failed", "detail": str(e)}).encode("utf-8")
+                self.send_response(500, "Internal Server Error")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body_bytes)))
             self.end_headers()
             self.wfile.write(body_bytes)
@@ -234,7 +236,8 @@ class HttpLogHandler(BaseHTTPRequestHandler):
 
         if not is_internal:
             self.write_log(request_info)
-        self.run_plugins(request_info)
+        if self.run_plugins(request_info):
+            return
 
         # Health check endpoint
         if parsed.path == "/healthz":
@@ -311,6 +314,7 @@ class RequestStats:
 class HttpLogServer(ThreadingHTTPServer):
     def __init__(self, server_address, RequestHandlerClass, log_file, verbose=False, log_viewer_path=None):
         super().__init__(server_address, RequestHandlerClass)
+        self._log_lock = threading.Lock()
         self.log_file = log_file
         self.verbose = verbose
         self.log_viewer_path = log_viewer_path

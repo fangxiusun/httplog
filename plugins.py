@@ -6,7 +6,9 @@ Plugin mechanism and built-in example plugins.
 
 import sys
 import traceback
-
+import uuid
+import datetime
+import re
 
 # =========================
 # 插件机制
@@ -44,21 +46,23 @@ def plugin(func):
 # 示例插件
 # =========================
 
+# Blocked IPs set - add IPs here to enable blocking
+BLOCKED_IPS = {
+    # "127.0.0.1",
+}
+
+
 @plugin
 def example_block_ip_plugin(request_info):
     """
     示例：按 IP 拦截。
 
-    如果要启用，把 127.0.0.1 改成你想拦截的 IP。
+    如果要启用，把 127.0.0.1 改成你想拦截的 IP（在 BLOCKED_IPS 集合中添加）。
     当前示例默认不拦截任何 IP。
     """
-    blocked_ips = {
-        # "127.0.0.1",
-    }
-
     client_ip = request_info["client"]["ip"]
 
-    if client_ip in blocked_ips:
+    if client_ip in BLOCKED_IPS:
         return {
             "status": 403,
             "headers": {
@@ -72,7 +76,6 @@ def example_block_ip_plugin(request_info):
         }
 
     return None
-
 
 @plugin
 def example_custom_path_plugin(request_info):
@@ -120,6 +123,82 @@ def example_body_keyword_plugin(request_info):
             "body": {
                 "ok": True,
                 "message": "pong"
+            }
+        }
+
+    return None
+
+
+
+# =========================
+# Bianlian Mock Plugin
+# =========================
+
+@plugin
+def bianlian_mock_plugin(request_info):
+    """
+    Mock for DashScope video-generation / video-synthesis API.
+
+    1. POST /api/v1/services/aigc/video-generation/video-synthesis
+       - Body model == "happyhorse-1.0-video-edit"
+       - Returns PENDING task with random task_id
+
+    2. GET /api/v1/tasks/{task_id}
+       - Returns SUCCEEDED result with mock video URL
+    """
+    path = request_info["url"]["path"]
+    method = request_info["request"]["method"]
+
+    # --- Submit task ---
+    if method == "POST" and path == "/api/v1/services/aigc/video-generation/video-synthesis":
+        body_json = request_info["body"].get("json")
+        if not body_json:
+            return None
+        if body_json.get("model") != "happyhorse-1.0-video-edit":
+            return None
+
+        task_id = str(uuid.uuid4())
+        return {
+            "status": 200,
+            "headers": {"Content-Type": "application/json; charset=utf-8"},
+            "body": {
+                "request_id": task_id,
+                "output": {
+                    "task_id": task_id,
+                    "task_status": "PENDING"
+                }
+            }
+        }
+
+    # --- Query task ---
+    match = re.match(r"^/api/v1/tasks/([a-f0-9\-]+)$", path)
+    if method == "GET" and match:
+        task_id = match.group(1)
+        now = datetime.datetime.now()
+        submit_time = (now - datetime.timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}"
+        scheduled_time = (now - datetime.timedelta(minutes=1, seconds=59)).strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}"
+        end_time = (now - datetime.timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}"
+        return {
+            "status": 200,
+            "headers": {"Content-Type": "application/json; charset=utf-8"},
+            "body": {
+                "request_id": str(uuid.uuid4()),
+                "output": {
+                    "task_id": task_id,
+                    "task_status": "SUCCEEDED",
+                    "submit_time": submit_time,
+                    "scheduled_time": scheduled_time,
+                    "end_time": end_time,
+                    "orig_prompt": "让视频中的马头人身角色穿上图片中的条纹毛衣",
+                    "video_url": "https://dashscope-result.oss-cn-beijing.aliyuncs.com/mock-bianlian-output.mp4"
+                },
+                "usage": {
+                    "duration": 13.24,
+                    "input_video_duration": 6.62,
+                    "output_video_duration": 6.62,
+                    "video_count": 1,
+                    "SR": 720
+                }
             }
         }
 

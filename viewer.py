@@ -172,7 +172,7 @@ class LogViewerHandler:
                 "<td>" + log["mtime_str"] + "</td>"
                 '<td class="size">' + self._fsize(log["size"]) + "</td>"
                 "<td>"
-                '  <a class="btn btn-view" href="' + html.escape(bp, quote=True) + '?file=' + log["name"] + '">View</a>'
+                '  <a class="btn btn-view" href="' + html.escape(bp, quote=True) + '?file=' + html.escape(log["name"], quote=True) + '">View</a>'
                 '  <a class="btn btn-dl" href="' + html.escape(bp, quote=True) + '?file=' + html.escape(log["name"]) + '&download=1">Download</a>'
                 "</td></tr>"
             )
@@ -206,18 +206,29 @@ class LogViewerHandler:
                                   self._err(bp, "Log file not found: " + filename))
 
         # pagination
-        limit = min(int(query.get("limit", ["200"])[0]), 2000)
-        offset = max(int(query.get("offset", ["0"])[0]), 0)
+        try:
+            limit = min(int(query.get("limit", ["200"])[0]), 2000)
+            offset = max(int(query.get("offset", ["0"])[0]), 0)
+        except (ValueError, IndexError):
+            return make_response(400, {"Content-Type": "text/html; charset=utf-8"},
+                                  self._err(bp, "Invalid limit/offset parameter"))
 
         try:
-            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                all_lines = f.readlines()
+            lines = []
+            total = 0
+            with open(filepath, "rb") as f:
+                for raw_line in f:
+                    total += 1
+                    if total > offset and total <= offset + limit:
+                        lines.append(raw_line.decode("utf-8", errors="replace"))
+                    if total > offset + limit:
+                        # count remaining lines for total
+                        for _ in f:
+                            total += 1
+                        break
         except Exception as e:
             return make_response(500, {"Content-Type": "text/html; charset=utf-8"},
                                   self._err(bp, "Error reading file: " + str(e)))
-
-        total = len(all_lines)
-        lines = all_lines[offset:offset + limit]
 
         rendered = ""
         for i, line in enumerate(lines):
@@ -384,7 +395,7 @@ class LogViewerHandler:
         return (
             '<div style="padding:8px 16px;display:flex;align-items:center;gap:10px;">'
             '<span style="width:120px;font-size:13px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
-            + html.escape(str(label)) + '</span>'
+            + str(label) + '</span>'
             '<div style="flex:1;background:#f0f0f0;border-radius:4px;height:18px;overflow:hidden;">'
             '<div style="width:' + str(min(pct, 100)) + '%;background:' + color + ';height:100%;border-radius:4px;"></div></div>'
             '<span style="width:60px;text-align:right;font-size:13px;font-family:monospace;color:#555;">'
@@ -401,7 +412,7 @@ class LogViewerHandler:
 
     def _resolve(self, log_pattern, filename):
         """resolve log file path, prevent path traversal."""
-        if ".." in filename or "/" in filename or chr(92) in filename:
+        if ".." in filename or "/" in filename or chr(92) in filename or chr(0) in filename:
             return None
         parts = log_pattern.replace(chr(92), "/").rsplit("/", 1)
         log_dir = parts[0] if len(parts) == 2 else "."

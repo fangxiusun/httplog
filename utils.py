@@ -43,7 +43,7 @@ def format_daily_log_path(log_pattern):
         logs/httplog.jsonl         -> logs/httplog-2025-06-05.jsonl
         httplog-%Y%m.jsonl         -> httplog-202506.jsonl
     """
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone()
 
     # strftime placeholders present: format directly
     if '%Y' in log_pattern or '%m' in log_pattern or '%d' in log_pattern:
